@@ -9,9 +9,12 @@ The parser only relies on:
 from __future__ import annotations
 
 import argparse
+import codecs
 import html
+import io
 import json
 import re
+from datetime import date, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -20,6 +23,8 @@ TIME_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\b")
 STREAM_RE = re.compile(r"\bstream=([^\]\s]+)")
 CHUNK_RE = re.compile(r"\bchunk=([^\]\s]+)")
 ROWS_RE = re.compile(r"\brows=(\d+)\b")
+FILE_SIZE_KB_RE = re.compile(r"\bfileSizeKb=([0-9]+(?:\.[0-9]+)?)\b")
+RUN_DATE_RE = re.compile(r"\brun=(\d{8})_\d{6}(?:_\d+)?\b")
 
 
 @dataclass
@@ -30,6 +35,7 @@ class ChunkWindow:
     end_s: int
     line_count: int = 0
     rows_processed: int = 0
+    file_size_kb_total: float = 0.0
 
     @property
     def duration_s(self) -> int:
@@ -44,6 +50,7 @@ class ParsedData:
     completed_streams: Set[str]
     stream_errors: Dict[str, List[str]]
     failed_chunks: Set[Tuple[str, str]]
+    base_date: Optional[date]
 
 
 def hms_to_seconds(hms: str) -> int:
@@ -57,6 +64,25 @@ def chunk_sort_value(chunk: str) -> Tuple[int, str]:
     return (1, chunk)
 
 
+def detect_text_encoding(sample: bytes) -> str:
+    if sample.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE):
+        # Let Python honor BOM and decode UTF-16 correctly.
+        return "utf-16"
+
+    # Heuristic for UTF-16 without BOM.
+    if b"\x00" in sample:
+        even_nulls = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
+        odd_nulls = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
+        if odd_nulls > even_nulls * 2:
+            return "utf-16-le"
+        if even_nulls > odd_nulls * 2:
+            return "utf-16-be"
+
+    return "utf-8"
+
+
 def parse_log(path: Path) -> ParsedData:
     open_windows: Dict[Tuple[str, str], ChunkWindow] = {}
     completed_streams: Set[str] = set()
@@ -64,12 +90,23 @@ def parse_log(path: Path) -> ParsedData:
     failed_chunks: Set[Tuple[str, str]] = set()
     last_raw_ts: Optional[int] = None
     day_offset = 0
+    base_date: Optional[date] = None
 
     timeline_start: Optional[int] = None
     timeline_end: Optional[int] = None
 
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    with path.open("rb") as bf:
+        sample = bf.read(4096)
+        encoding = detect_text_encoding(sample)
+        bf.seek(0)
+        f = io.TextIOWrapper(bf, encoding=encoding, errors="replace", newline=None)
         for line in f:
+            if base_date is None:
+                run_match = RUN_DATE_RE.search(line)
+                if run_match:
+                    d = run_match.group(1)
+                    base_date = date(int(d[0:4]), int(d[4:6]), int(d[6:8]))
+
             tmatch = TIME_RE.match(line)
             if not tmatch:
                 continue
@@ -98,6 +135,8 @@ def parse_log(path: Path) -> ParsedData:
                 key = (stream, chunk)
                 rows_match = ROWS_RE.search(line)
                 rows_value = int(rows_match.group(1)) if rows_match else None
+                size_match = FILE_SIZE_KB_RE.search(line)
+                file_size_kb_value = float(size_match.group(1)) if size_match else 0.0
 
                 if key not in open_windows:
                     open_windows[key] = ChunkWindow(
@@ -107,6 +146,7 @@ def parse_log(path: Path) -> ParsedData:
                         end_s=ts,
                         line_count=1,
                         rows_processed=rows_value or 0,
+                        file_size_kb_total=file_size_kb_value,
                     )
                 else:
                     cw = open_windows[key]
@@ -117,6 +157,7 @@ def parse_log(path: Path) -> ParsedData:
                     cw.line_count += 1
                     if rows_value is not None:
                         cw.rows_processed = max(cw.rows_processed, rows_value)
+                    cw.file_size_kb_total += file_size_kb_value
 
             if timeline_start is None or ts < timeline_start:
                 timeline_start = ts
@@ -139,6 +180,7 @@ def parse_log(path: Path) -> ParsedData:
         completed_streams=completed_streams,
         stream_errors=stream_errors,
         failed_chunks=failed_chunks,
+        base_date=base_date,
     )
 
 
@@ -165,7 +207,14 @@ def duration_label(total_seconds: int) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
-def absolute_time_label(ts_abs: int) -> str:
+def absolute_time_label(ts_abs: int, base_date: Optional[date] = None) -> str:
+    if base_date is not None:
+        day = ts_abs // 86400
+        h = (ts_abs // 3600) % 24
+        m = (ts_abs % 3600) // 60
+        current_date = base_date + timedelta(days=day)
+        return f"{current_date:%Y-%m-%d} {h:02d}:{m:02d}"
+
     day = ts_abs // 86400
     base = seconds_label(ts_abs)
     if day <= 0:
@@ -175,6 +224,10 @@ def absolute_time_label(ts_abs: int) -> str:
 
 def format_int(n: int) -> str:
     return f"{n:,}"
+
+
+def format_kb(n: float) -> str:
+    return f"{n:,.1f}"
 
 
 def render_html(data: ParsedData, title: str) -> str:
@@ -203,6 +256,9 @@ def render_html(data: ParsedData, title: str) -> str:
     stream_total_rows: Dict[str, int] = {
         s: sum(c.rows_processed for c in chunks_by_stream[s]) for s in stream_order
     }
+    stream_total_file_size_kb: Dict[str, float] = {
+        s: sum(c.file_size_kb_total for c in chunks_by_stream[s]) for s in stream_order
+    }
     global_total_rows = sum(c.rows_processed for c in chunks)
 
     # Initial collapsed height: summary rows only. JS adjusts height when expanded.
@@ -223,7 +279,7 @@ def render_html(data: ParsedData, title: str) -> str:
         x = x_at(t)
         tick_lines.append(
             f'<line x1="{x:.2f}" y1="{top_pad - 16}" x2="{x:.2f}" y2="{height - 28}" stroke="#e5e7eb" stroke-width="1" />'
-            f'<text x="{x:.2f}" y="{top_pad - 22}" class="tick" text-anchor="middle">{absolute_time_label(t)}</text>'
+            f'<text x="{x:.2f}" y="{top_pad - 22}" class="tick" text-anchor="middle">{absolute_time_label(t, data.base_date)}</text>'
         )
         t += tick_step_s
 
@@ -243,9 +299,10 @@ def render_html(data: ParsedData, title: str) -> str:
         stream_label = f"{stream} ({n_chunks} chunks)"
         stream_error_text = "\n\n".join(data.stream_errors.get(stream, []))
         stream_title = (
-            f"{stream} | status={stream_status} | start={absolute_time_label(s0)} | "
-            f"end={absolute_time_label(s1)} | duration={duration_label(max(0, s1 - s0))} | "
-            f"chunks={n_chunks} | rows={format_int(stream_total_rows[stream])}"
+            f"{stream} | status={stream_status} | start={seconds_label(s0)} | "
+            f"end={seconds_label(s1)} | duration={duration_label(max(0, s1 - s0))} | "
+            f"chunks={n_chunks} | rows={format_int(stream_total_rows[stream])} | "
+            f"fileSizeKbTotal={format_kb(stream_total_file_size_kb[stream])}"
         )
         if stream_error_text:
             stream_title += f"\n\nException:\n{stream_error_text}"
@@ -275,7 +332,7 @@ def render_html(data: ParsedData, title: str) -> str:
                 f'<text x="{left_pad - 10}" y="{bar_h - 1}" class="label" text-anchor="end">{html.escape(label)}</text>'
                 f'<rect x="{c_start_x:.2f}" y="0" width="{c_width:.2f}" height="{bar_h}" rx="3" ry="3" '
                 f'fill="{chunk_fill}" opacity="0.58">'
-                f'<title>{html.escape(label)} | status={chunk_status} | start={absolute_time_label(chunk.start_s)} | end={absolute_time_label(chunk.end_s)} | duration={duration_label(chunk.duration_s)} | rows={format_int(chunk.rows_processed)}</title>'
+                f'<title>{html.escape(label)} | status={chunk_status} | start={seconds_label(chunk.start_s)} | end={seconds_label(chunk.end_s)} | duration={duration_label(chunk.duration_s)} | rows={format_int(chunk.rows_processed)} | fileSizeKbTotal={format_kb(chunk.file_size_kb_total)}</title>'
                 f"</rect>"
                 f"</g>"
             )
@@ -302,7 +359,7 @@ def render_html(data: ParsedData, title: str) -> str:
 </head>
 <body>
   <h1>{html.escape(title)}</h1>
-  <p class=\"meta\">Collapsed: 1 bar per stream. Click a stream bar to expand its chunks. Total chunks: {len(chunks)} | Total rows: {global_total_rows} | Timeline: {absolute_time_label(data.timeline_start)} to {absolute_time_label(data.timeline_end)} ({duration_label(total_span)})</p>
+  <p class=\"meta\">Click a stream bar to expand its chunks. Total chunks: {format_int(len(chunks))} | Total rows: {format_int(global_total_rows)} | Timeline: {absolute_time_label(data.timeline_start, data.base_date)} to {absolute_time_label(data.timeline_end, data.base_date)} ({duration_label(total_span)})</p>
   <div class=\"chart-wrap\">
     <svg id=\"gantt\" width=\"{left_pad + right_pad + chart_w}\" height=\"{height}\" role=\"img\" aria-label=\"Chunk Gantt chart\">
       <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"white\"/>
