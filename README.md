@@ -2,7 +2,7 @@
 
 Small Python tool that turns pluck-style logs into an interactive Gantt HTML visualization.
 
-![Gantt Diagram Screenshot](screenshot.png)
+![Gantt Diagram Screenshot](Screenshot.png)
 
 ## What It Shows
 
