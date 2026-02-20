@@ -230,6 +230,16 @@ def format_kb(n: float) -> str:
     return f"{n:,.1f}"
 
 
+def format_exception_text(raw: str) -> str:
+    """Normalize escaped newlines and add breaks for common stack-trace tokens."""
+    text = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    text = re.sub(r"(?<!\n)\s+(Caused by:)", r"\n\1", text)
+    text = re.sub(r"(?<!\n)\s+(Suppressed:)", r"\n\1", text)
+    text = re.sub(r"(?<!\n)\s+(Traceback \(most recent call last\):)", r"\n\1", text)
+    text = re.sub(r"(?<!\n)\s+(at\s+)", r"\n\1", text)
+    return text
+
+
 def render_html(data: ParsedData, title: str) -> str:
     chunks = data.chunks
 
@@ -285,6 +295,7 @@ def render_html(data: ParsedData, title: str) -> str:
 
     row_svg: List[str] = []
     row_order: List[str] = []
+    stream_errors_for_copy: Dict[str, str] = {}
     for stream in stream_order:
         s0, s1, n_chunks = stream_windows[stream]
         stream_status = "running"
@@ -297,7 +308,11 @@ def render_html(data: ParsedData, title: str) -> str:
         end_x = x_at(s1)
         width = max(2.0, end_x - start_x)
         stream_label = f"{stream} ({n_chunks} chunks)"
-        stream_error_text = "\n\n".join(data.stream_errors.get(stream, []))
+        stream_error_text = "\n\n".join(
+            format_exception_text(err) for err in data.stream_errors.get(stream, [])
+        )
+        if stream_error_text:
+            stream_errors_for_copy[stream] = stream_error_text
         stream_title = (
             f"{stream} | status={stream_status} | start={seconds_label(s0)} | "
             f"end={seconds_label(s1)} | duration={duration_label(max(0, s1 - s0))} | "
@@ -337,6 +352,31 @@ def render_html(data: ParsedData, title: str) -> str:
                 f"</g>"
             )
 
+    error_panel_items: List[str] = []
+    for stream in stream_order:
+        stream_error_text = stream_errors_for_copy.get(stream)
+        if not stream_error_text:
+            continue
+        error_panel_items.append(
+            f'<div class="error-item">'
+            f'<div class="error-item-head">'
+            f'<strong>{html.escape(stream)}</strong>'
+            f'<button type="button" class="copy-btn" data-stream="{html.escape(stream)}">Copy exception</button>'
+            f'</div>'
+            f'<pre class="error-text">{html.escape(stream_error_text)}</pre>'
+            f'</div>'
+        )
+
+    error_panel_html = ""
+    if error_panel_items:
+        error_panel_html = (
+            '<section class="errors-wrap">'
+            '<h2>Stream Exceptions</h2>'
+            '<p class="meta">Use Copy exception to copy a stream\'s full exception text to the clipboard.</p>'
+            f"{''.join(error_panel_items)}"
+            '</section>'
+        )
+
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -355,6 +395,13 @@ def render_html(data: ParsedData, title: str) -> str:
     .summary-row:focus {{ outline: none; }}
     .summary-label {{ font-weight: 600; }}
     .summary-row.active .summary-label {{ fill: #0f172a; text-decoration: underline; }}
+    .errors-wrap {{ margin-top: 14px; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; background: #fff; }}
+    .errors-wrap h2 {{ margin: 0 0 8px; font-size: 1rem; }}
+    .error-item + .error-item {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid #e2e8f0; }}
+    .error-item-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }}
+    .copy-btn {{ border: 1px solid #cbd5e1; border-radius: 6px; background: #f8fafc; color: #0f172a; padding: 4px 8px; cursor: pointer; font-size: .84rem; }}
+    .copy-btn:hover {{ background: #f1f5f9; }}
+    .error-text {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px; font-size: .82rem; color: #1f2937; }}
   </style>
 </head>
 <body>
@@ -367,10 +414,12 @@ def render_html(data: ParsedData, title: str) -> str:
       {''.join(row_svg)}
     </svg>
   </div>
+  {error_panel_html}
   <script>
     const rowHeight = {row_h};
     const topPad = {top_pad};
     const streamOrder = {json.dumps(row_order)};
+    const streamErrors = {json.dumps(stream_errors_for_copy)};
     const svg = document.getElementById("gantt");
     let expandedStream = null;
 
@@ -406,6 +455,31 @@ def render_html(data: ParsedData, title: str) -> str:
         line.setAttribute("y2", String(h - 28));
       }});
     }}
+
+    async function copyStreamError(stream) {{
+      const text = streamErrors[stream];
+      if (!text) return;
+      try {{
+        await navigator.clipboard.writeText(text);
+      }} catch (_err) {{
+        // Fallback for environments that block clipboard API.
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }}
+    }}
+
+    document.querySelectorAll(".copy-btn").forEach((btn) => {{
+      btn.addEventListener("click", () => {{
+        copyStreamError(btn.dataset.stream || "");
+      }});
+    }});
 
     layoutRows();
   </script>
